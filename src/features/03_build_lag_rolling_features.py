@@ -27,12 +27,12 @@ def main():
         df[f"roll_std_{w}"] = shifted.rolling(w).std()
 
     # Optional: simple trend feature
-    df["diff_1"] = df["units"] - df["lag_1"]
+    # df["diff_1"] = df["units"] - df["lag_1"]
 
     # Drop rows that don't have enough history for features
     feature_cols = [f"lag_{l}" for l in LAGS] + \
                    [f"roll_mean_{w}" for w in ROLL_WINDOWS] + \
-                   [f"roll_std_{w}" for w in ROLL_WINDOWS] + ["diff_1"]
+                   [f"roll_std_{w}" for w in ROLL_WINDOWS] #+ ["diff_1"]
 
     before = len(df)
     df = df.dropna(subset=feature_cols).reset_index(drop=True)
