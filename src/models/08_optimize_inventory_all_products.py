@@ -7,8 +7,8 @@ from ortools.linear_solver import pywraplp
 DATA_IN = "data/demand_model_features.parquet"
 
 HORIZON = 28
-TOTAL_INVENTORY = 20000  # you can change later
-
+INVENTORY_SCENARIOS = [10000, 20000, 40000, 80000]  # scenario analysis
+MIN_SERVICE = 0.02  # 2% minimum coverage for every product
 
 FEATURE_COLS = [
     "price", "promo_flag", "discount_pct",
@@ -34,17 +34,12 @@ def train_global_model(df: pd.DataFrame) -> XGBRegressor:
 
 
 def recursive_forecast_one_series(model: XGBRegressor, series_df: pd.DataFrame, horizon=28) -> pd.DataFrame:
-    """
-    series_df must be for ONE product-region, sorted by d, contains:
-    d, units, price, promo_flag, discount_pct
-    plus enough history for 28-day lags.
-    """
     series_df = series_df.sort_values("d").reset_index(drop=True)
 
     last_date = series_df["d"].max()
     history_units = series_df["units"].to_list()
 
-    # Carry forward last known price/promo assumptions
+    # Carry forward last known price/promo assumptions (simple default)
     last = series_df.iloc[-1]
     price = float(last["price"])
     promo_flag = int(last["promo_flag"])
@@ -55,7 +50,6 @@ def recursive_forecast_one_series(model: XGBRegressor, series_df: pd.DataFrame, 
     for step in range(1, horizon + 1):
         next_date = last_date + pd.Timedelta(days=step)
 
-        # Lags (need at least 28)
         lag_1 = history_units[-1]
         lag_7 = history_units[-7]
         lag_14 = history_units[-14]
@@ -102,37 +96,41 @@ def recursive_forecast_one_series(model: XGBRegressor, series_df: pd.DataFrame, 
     return pd.DataFrame(forecasts)
 
 
-def optimize_allocation(product_forecasts: pd.DataFrame, total_inventory: int) -> pd.DataFrame:
+def optimize_allocation(product_forecasts: pd.DataFrame, total_inventory: int, min_service: float) -> pd.DataFrame:
     """
     product_forecasts columns:
       product_id, forecast_demand_28d, unit_profit
-    Decision: allocate_units[product] (integer)
-    Objective: maximize sum(unit_profit * min(allocate, demand))
-    We'll model expected_sold <= demand and expected_sold <= allocate
+    Decision: alloc[product] (integer), sold[product] (continuous)
+    Constraints:
+      sum alloc <= total_inventory
+      alloc >= min_service * demand
+      sold <= alloc
+      sold <= demand
+    Objective:
+      maximize sum(unit_profit * sold)
     """
     solver = pywraplp.Solver.CreateSolver("SCIP")
     if solver is None:
         raise RuntimeError("SCIP solver not available. OR-Tools install issue.")
 
     products = product_forecasts["product_id"].tolist()
-    min_service = 0.02  # 10% minimum coverage for every product
 
     alloc = {p: solver.IntVar(0, total_inventory, f"alloc_{p}") for p in products}
     sold = {p: solver.NumVar(0, solver.infinity(), f"sold_{p}") for p in products}
 
-    # Constraints: total allocation
     solver.Add(sum(alloc[p] for p in products) <= total_inventory)
 
-    # sold constraints per product
     for _, row in product_forecasts.iterrows():
         p = row["product_id"]
         demand = float(row["forecast_demand_28d"])
+
+        # Minimum coverage
         solver.Add(alloc[p] >= min_service * demand)
 
+        # Can’t sell more than you allocate or demand
         solver.Add(sold[p] <= alloc[p])
         solver.Add(sold[p] <= demand)
 
-    # Objective: maximize profit
     objective = solver.Objective()
     for _, row in product_forecasts.iterrows():
         p = row["product_id"]
@@ -142,22 +140,25 @@ def optimize_allocation(product_forecasts: pd.DataFrame, total_inventory: int) -
 
     status = solver.Solve()
     if status != pywraplp.Solver.OPTIMAL:
-        raise RuntimeError("Optimization did not find an optimal solution.")
+        raise RuntimeError("Optimization did not find an optimal solution (likely infeasible).")
 
     results = []
     for _, row in product_forecasts.iterrows():
         p = row["product_id"]
+        demand = float(row["forecast_demand_28d"])
+        up = float(row["unit_profit"])
+        a = float(alloc[p].solution_value())
+        s = float(sold[p].solution_value())
         results.append({
             "product_id": p,
-            "forecast_demand_28d": float(row["forecast_demand_28d"]),
-            "unit_profit": float(row["unit_profit"]),
-            "allocated_units": int(round(alloc[p].solution_value())),
-            "expected_sold": float(sold[p].solution_value()),
-            "expected_profit": float(sold[p].solution_value()) * float(row["unit_profit"]),
+            "forecast_demand_28d": demand,
+            "unit_profit": up,
+            "allocated_units": int(round(a)),
+            "expected_sold": s,
+            "expected_profit": s * up
         })
 
-    out = pd.DataFrame(results).sort_values("expected_profit", ascending=False).reset_index(drop=True)
-    return out
+    return pd.DataFrame(results).sort_values("expected_profit", ascending=False).reset_index(drop=True)
 
 
 def main():
@@ -204,37 +205,58 @@ def main():
     )
 
     # Compute unit profit per product (avg from history)
-    profit_by_product = (
-        df.groupby("product_id")["unit_profit"].mean().reset_index()
-    )
+    profit_by_product = df.groupby("product_id")["unit_profit"].mean().reset_index()
 
     product_forecasts = product_demand.merge(profit_by_product, on="product_id", how="left")
     product_forecasts["unit_profit"] = product_forecasts["unit_profit"].fillna(0)
 
-    min_service = 0.02
-    required_min = float((product_forecasts["forecast_demand_28d"] * min_service).sum())
-    print(f"Minimum required inventory for {min_service*100:.0f}% service: {required_min:.0f}")
-    print(f"Available inventory: {TOTAL_INVENTORY}")
-
-    if required_min > TOTAL_INVENTORY:
-        print("⚠️ Infeasible with current TOTAL_INVENTORY. Lower min_service or increase TOTAL_INVENTORY.")
-
-    # Run optimization
-    print(f"Running optimization with TOTAL_INVENTORY={TOTAL_INVENTORY} units...")
-    alloc_plan = optimize_allocation(product_forecasts, total_inventory=TOTAL_INVENTORY)
-
-    # Save outputs
+    # Save the forecast file once (common across scenarios)
     fc_path = f"data/forecast_all_products_next{HORIZON}.csv"
     fc_all.to_csv(fc_path, index=False)
-
-    alloc_path = f"data/allocation_plan_total{TOTAL_INVENTORY}.csv"
-    alloc_plan.to_csv(alloc_path, index=False)
-
     print("\nSaved forecasts:", fc_path)
-    print("Saved allocation plan:", alloc_path)
 
-    print("\nTop 10 products by expected_profit:")
-    print(alloc_plan.head(10))
+    # Feasibility check for min service
+    required_min = float((product_forecasts["forecast_demand_28d"] * MIN_SERVICE).sum())
+    print(f"\nMinimum required inventory for {MIN_SERVICE*100:.0f}% service across all products: {required_min:.0f}")
+
+    # Run scenarios
+    scenario_rows = []
+    for inv in INVENTORY_SCENARIOS:
+        print(f"\n--- Scenario: TOTAL_INVENTORY={inv} ---")
+        if required_min > inv:
+            print("Infeasible with this inventory level. Skipping.")
+            scenario_rows.append({
+                "inventory": inv,
+                "status": "infeasible",
+                "total_expected_profit": None
+            })
+            continue
+
+        alloc_plan = optimize_allocation(product_forecasts, total_inventory=inv, min_service=MIN_SERVICE)
+
+        alloc_path = f"data/allocation_plan_total{inv}.csv"
+        alloc_plan.to_csv(alloc_path, index=False)
+
+        total_profit = float(alloc_plan["expected_profit"].sum())
+        scenario_rows.append({
+            "inventory": inv,
+            "status": "optimal",
+            "total_expected_profit": total_profit
+        })
+
+        print(f"Saved allocation plan: {alloc_path}")
+        print(f"Total Expected Profit: {total_profit:,.0f}")
+        print("Top 5 products by expected_profit:")
+        print(alloc_plan.head(5))
+
+    scenario_df = pd.DataFrame(scenario_rows)
+
+    scenario_path = "data/optimization_scenarios_summary.csv"
+    scenario_df.to_csv(scenario_path, index=False)
+
+    print("\n=== Scenario Summary ===")
+    print(scenario_df)
+    print("\nSaved scenario summary:", scenario_path)
 
 
 if __name__ == "__main__":
